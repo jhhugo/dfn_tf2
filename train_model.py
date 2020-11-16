@@ -166,14 +166,14 @@ if __name__ == "__main__":
     feedback_group_ids=[3060,3061,3063,3064]
     pos_group_ids=[3065]
 
-    path = Path(r"E:\ML_study\deepctr\dfn_tf2\example")
+    path = Path("/Volumes/D/guohao/resys/dfn_t2/example")
     train_data, train_label, sample_weight = next(data_gen(path))
     dfn = DFN(main_group_ids, candidate_group_ids, clicked_group_ids, unclick_group_ids, feedback_group_ids, pos_group_ids)
     output = dfn()
     model = tf.keras.models.Model(inputs=dfn.group_feature, outputs=output) 
     # print(model)
-    # model.compile(tf.keras.optimizers.Adagrad(), "binary_crossentropy",
-    #               metrics=['binary_crossentropy'], )
-    # history = model.fit(train_data, train_label, epochs=25, batch_size=256, shuffle=True, sample_weight=sample_weight)
+    model.compile(tf.keras.optimizers.Adagrad(learning_rate=0.00001), "binary_crossentropy",
+                  metrics=['binary_crossentropy'], )
+    history = model.fit(train_data, train_label, epochs=25, batch_size=256, shuffle=True, sample_weight=sample_weight)
     # history = model.fit(data_gen(path), epochs=25, batch_size=batch_size, shuffle=False)
                 

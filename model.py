@@ -12,24 +12,24 @@ class Sequence_Embedding(tf.keras.layers.Layer):
         self.unclick_item_dim = unclick_item_dim
         self.feedback_item_dim = feedback_item_dim
         self.item_dim = item_dim
-
-    def build(self, input_shape):
-        super().build(input_shape)
         self.pos_w_clicked = self.add_weight(name="pos_w_clicked", shape=(self.clicked_item_dim + self.pos_item_dim, self.item_dim), 
-                                             initializer=tf.keras.initializers.GlorotNormal(),
+                                             initializer=initializers,
                                              dtype=tf.float32)
         self.pos_w_unclick = self.add_weight(name="pos_w_unclick", shape=(self.unclick_item_dim + self.pos_item_dim, self.item_dim), 
-                                             initializer=tf.keras.initializers.GlorotNormal(),
+                                             initializer=initializers,
                                              dtype=tf.float32)
         self.pos_w_feedback = self.add_weight(name="pos_w_feedback", shape=(self.feedback_item_dim + self.pos_item_dim, self.item_dim), 
-                                             initializer=tf.keras.initializers.GlorotNormal(),
+                                             initializer=initializers,
                                              dtype=tf.float32)
 
     def call(self, inputs, **kwargs):
         clicked_z = tf.matmul(inputs[0], self.pos_w_clicked)
         unclick_z = tf.matmul(inputs[1], self.pos_w_unclick)
         feedback_z = tf.matmul(inputs[2], self.pos_w_feedback)
-        return clicked_z, unclick_z, feedback_z
+        return [clicked_z, unclick_z, feedback_z]
+
+    def compute_output_shape(self, input_shape):
+        return [(None, self.item_dim), (None, self.item_dim), (None, self.item_dim)]
 
 class Embedding_Lookup(tf.keras.layers.Layer):
     def __init__(self, feature_size, embed_dim, initializers=tf.keras.initializers.GlorotNormal(), **kwargs):
@@ -47,6 +47,9 @@ class Embedding_Lookup(tf.keras.layers.Layer):
     def call(self, inputs, **kwargs):
         embedding = tf.nn.embedding_lookup_sparse(self.embedding_w, inputs, sp_weights=None, combiner='mean')
         return embedding
+
+    def compute_output_shape(self, input_shape):
+        return (None, self.embed_dim)
 
 class Transformer(tf.keras.layers.Layer):
     def __init__(self, hist_size, hist_embedding_dim, prefix="",initializers=tf.keras.initializers.GlorotNormal(), **kwargs):
@@ -77,7 +80,7 @@ class Transformer(tf.keras.layers.Layer):
         candidate_embedding, hist_embeddings, hisLens = inputs
         hist_size = self.hist_size + 1
         hist_z = [candidate_embedding]
-        for i in range(0, len(hist_embeddings)):
+        for i in range(0, self.hist_size):
             hist_z.append(hist_embeddings[i])
         hist_z_all = tf.stack(hist_z, axis=1) #(batch, hist_size, hist_embedding_dim)
         
@@ -97,7 +100,7 @@ class Transformer(tf.keras.layers.Layer):
             padding = tf.ones_like(attQK_scale) * (-2 ** 32 + 1) #(batch, hist_size, hist_size)
 
             #mask
-            key_masks = tf.sequence_mask(hisLens + 1, hist_size)  # (batch, hist_size)
+            key_masks = tf.sequence_mask(hisLens + 1, hist_size)  # (batch, 1, hist_size)
             key_masks_new = tf.reshape(key_masks, [-1, 1, hist_size])
             key_masks_tile = tf.tile(key_masks_new, [1, hist_size, 1]) #(batch, hist_size, hist_size)
             key_masks_cast = tf.cast(key_masks_tile, dtype=tf.float32)
@@ -114,11 +117,10 @@ class Transformer(tf.keras.layers.Layer):
 
         outputs_QKV = tf.concat(mutil_head_att, axis=2) # (batch, hist_size, hist_embedding_dim)
         #FFN
-        
         TH0 = tf.tensordot(outputs_QKV, self.FFN_w0, axes=1) + self.FFN_b0 #(batch, hist_size, hist_embedding_dim * 4)
         TZ0 = tf.nn.relu(TH0)
-        TH1 = tf.tensordot(TZ0, self.FFN_w1, axes=1) + self.FFN_b1
-        # average pool
+        TH1 = tf.tensordot(TZ0, self.FFN_w1, axes=1) + self.FFN_b1 # (batch, hist_size, hist_embedding_dim)
+
         return tf.reduce_sum(TH1, axis=1) #(batch, hist_embedding_dim)
     
     def compute_output_shape(self, input_shape):
@@ -150,29 +152,31 @@ class Attention(tf.keras.layers.Layer):
             z1 = tf.concat([candidate_embedding, hist_embeddings[i], candidate_embedding * hist_embeddings[i], candidate_embedding - hist_embeddings[i]], axis=1)
             hist_embedding_list.append(z1)
         hist_z_all = tf.stack(hist_embeddings, axis=1) #(batch, hist_size, hist_embedding_dim)
-        z2 = tf.concat(hist_embedding_list, axis=1)  #(batch, hist_size * hist_embedding_dim * 4)
-        z3 = tf.reshape(z2, [-1, self.hist_size, 4 * self.hist_embedding_dim])
-        z4 = tf.tensordot(z3, self.attW1, axes=1) + self.attB1 #(batch , hist_size, attention_hidden_)
-        z5 = tf.nn.relu(z4)
-        z6 = tf.tensordot(z5, self.attW2, axes=1) + self.attB2 #(batch, hist_size, 1)
-        att_w_all = tf.reshape(z6, [-1, self.hist_size])
 
-        #mask
+        z2 = tf.concat(hist_embedding_list, axis=1)  #(batch, hist_size * hist_embedding_dim * 4)
+
+        z3 = tf.reshape(z2, [-1, self.hist_size, 4 * self.hist_embedding_dim])
+
+        z4 = tf.matmul(z3, self.attW1) + self.attB1
+        z5 = tf.nn.relu(z4)
+        z6 = tf.matmul(z5, self.attW2) + self.attB2
+        att_w_all = tf.squeeze(z6, axis=2)
+
+        # mask
         hist_masks = tf.sequence_mask(hisLens, self.hist_size) #(batch, hist_size)
         padding = tf.ones_like(att_w_all) * (-2**32 + 1)
         att_w_all_rep = tf.where(hist_masks, att_w_all, padding)
 
-        #scale
+        # scale
         att_w_all_scale = att_w_all_rep / (self.hist_embedding_dim ** 0.5)
 
-        #norm
+        # norm
         att_w_all_norm = tf.nn.softmax(att_w_all_scale)
 
         att_w_all_mul = tf.reshape(att_w_all_norm, [-1, 1, self.hist_size])
-        print("att_w_all_mul", att_w_all_mul.shape)
-        print("hist_z_all", hist_z_all.shape)
+
         weighted_hist_all = tf.matmul(att_w_all_mul, hist_z_all) #(batch, 1, hist_embedding_dim)
-        # print("weighted_hist_all", weighted_hist_all.shape)
+
         return tf.squeeze(weighted_hist_all, axis=1)
 
     def compute_output_shape(self, input_shape):
@@ -311,9 +315,9 @@ class DFN():
                 self.group_feature["clicked" + "_" + "position" + "_" + str(i) + "_" + str(group_id)] = tf.keras.layers.Input(shape=(self.feature_size, ), dtype=tf.int32, sparse=True, name=("clicked" + "_" + "position" + "_"+str(i) + "_"+str(group_id)))
                 self.group_feature["unclick" + "_" + "position" + "_" + str(i) + "_" + str(group_id)] = tf.keras.layers.Input(shape=(self.feature_size, ), dtype=tf.int32, sparse=True, name=("unclick" + "_" + "position" + "_"+str(i) + "_" + str(group_id)))
                 self.group_feature["feedback" + "_" + "position" + "_" + str(i) + "_" + str(group_id)] = tf.keras.layers.Input(shape=(self.feature_size, ), dtype=tf.int32, sparse=True, name=("feedback" + "_" + "position" + "_"+str(i) + "_" + str(group_id)))
-        self.group_feature["clicked_histLen"] = tf.keras.layers.Input(shape=(1, ), dtype=tf.float32, name=("clicked_histLen"))
-        self.group_feature["unclick_histLen"] = tf.keras.layers.Input(shape=(1, ), dtype=tf.float32, name=("unclick_histLen"))
-        self.group_feature["feedback_histLen"] = tf.keras.layers.Input(shape=(1, ), dtype=tf.float32, name=("feedback_histLen"))
+        self.group_feature["clicked_histLen"] = tf.keras.layers.Input(shape=(), dtype=tf.float32, name=("clicked_histLen"))
+        self.group_feature["unclick_histLen"] = tf.keras.layers.Input(shape=(), dtype=tf.float32, name=("unclick_histLen"))
+        self.group_feature["feedback_histLen"] = tf.keras.layers.Input(shape=(), dtype=tf.float32, name=("feedback_histLen"))
 
     def embedding_lookup(self, group_ids, prefix=""):
         embeddings = []
@@ -340,7 +344,6 @@ class DFN():
         for i in range(0, self.hist_size):
             # 一个用户不用field都有30长的序列，对于用户序列，每个序号求相同field的mean
             # batch_size, len(clicked_group_ids) * embed_dim
-            self.embedding_lookup(self.main_group_ids, prefix="main_")
             clicked_embedding = self.embedding_lookup(self.clicked_group_ids, prefix = "clicked" + "_" + str(i) + "_")
             unclick_embedding = self.embedding_lookup(self.unclick_group_ids, prefix="unclick" + "_" + str(i) + "_")
             feedback_embedding = self.embedding_lookup(self.feedback_group_ids, prefix="feedback" + "_" + str(i) + "_")
@@ -375,39 +378,27 @@ class DFN():
         candidate_embedding_wide = tf.concat(candidate_embeddings_wide, axis=1)
 
         # batch, hist_embedding_dim
-        # transformer = Transformer(self.hist_size, self.item_dim)
         output_clicked = Transformer(self.hist_size, self.item_dim, prefix="clicked")([candidate_embedding, clicked_embeddings, self.group_feature["clicked_histLen"]])
         output_unclick = Transformer(self.hist_size, self.item_dim, prefix="unclick")([candidate_embedding, unclick_embeddings, self.group_feature["unclick_histLen"]])
         output_feedback = Transformer(self.hist_size, self.item_dim, prefix="feedback")([candidate_embedding, feedback_embeddings, self.group_feature["feedback_histLen"]])
-        print("output_clicked", output_clicked.shape)
-        print("output_unclick", output_unclick.shape)
-        print("output_feedback", output_feedback.shape)
 
-        # attention = Attention(self.hist_size, self.item_dim)
-        print("att_input", output_clicked.shape, len(unclick_embeddings), unclick_embeddings[0].shape, self.group_feature["unclick_histLen"].shape)
         output_unclick_clicked = Attention(self.hist_size, self.item_dim, prefix="unclick_clicked")([output_clicked, unclick_embeddings, self.group_feature["unclick_histLen"]])
         output_unclick_feedback = Attention(self.hist_size, self.item_dim, prefix="unclick_feedback")([output_feedback, unclick_embeddings, self.group_feature["unclick_histLen"]])
-        print("output_unclick_clicked", output_unclick_clicked.shape)
-        print("output_unclick_feedback", output_unclick_feedback.shape)
 
         input_embedding = tf.concat([main_embedding, candidate_embedding, output_clicked, output_unclick, output_feedback, output_unclick_clicked, output_unclick_feedback],axis=1)
-        print("input_embedding", input_embedding.shape)
 
         #fm part 这个*6估计相当于multihead一样，切分成多个子空间进行两两交叉组合
         m = len(self.main_group_ids) + len(self.candidate_group_ids) * 6
         fm_in = tf.reshape(input_embedding, shape=[-1, m, self.embed_dim])
-        print("fm_in", fm_in.shape)
         sum1 = tf.reduce_sum(fm_in, axis=1)
         sum2 = tf.reduce_sum(fm_in * fm_in, axis=1)
         fm = (sum1 * sum1 - sum2) * 0.5
-        print("fm", fm.shape)
 
         #deep part
         deep = DNN([32, 16])(input_embedding)
-        print("deep", deep.shape)
 
         z = tf.concat([deep, fm, main_embedding_wide, candidate_embedding_wide], axis=1)
-        print("z", z.shape)
+
         results = DNN([1,], activation="sigmoid")(z)
-        print("results", results.shape)
+
         return tf.reshape(results, [-1, 1])
